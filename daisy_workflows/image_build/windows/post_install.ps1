@@ -684,7 +684,7 @@ function Get-WinREImagePath {
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "reagentc.exe /info command failed with exit code $LASTEXITCODE. Output: $reagentInfoOutput"
     } else {
-        $winreLocationLine = $reagentInfoOutput | Select-String -Pattern "Windows RE location:"
+        $winreLocationLine = ($reagentInfoOutput -split '\r?\n') | Select-String -Pattern "Windows RE location:"
         if ($winreLocationLine) {
             # Example line: Windows RE location:       \\?\GLOBALROOT\device\harddisk0\partition1\Recovery\WindowsRE
             $WinREDir = $winreLocationLine.Line.Split(':',2)[-1].Trim() # Takes the part after the first colon
