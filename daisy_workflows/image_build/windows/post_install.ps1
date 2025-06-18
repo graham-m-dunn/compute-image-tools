@@ -730,6 +730,7 @@ function Get-WinREImagePath {
   return $WinREImagePath
 }
 
+
 function Update-WinRE {
   Write-Host "Updating Windows Recovery Environment (WinRE)..."
   $WinREImagePath = Get-WinREImagePath
@@ -756,8 +757,8 @@ function Update-WinRE {
   Write-Host "Exporting all third-party drivers from current OS to $ExportedDriversDir..."
   # Note: DISM /Export-Driver exports third-party drivers.
   # It creates subdirectories for each driver package.
-  $exportCmdArgs = "/Online /Export-Driver /Destination:`"$ExportedDriversDir`""
-  $exportOutput = Run-Command "Dism.exe" $exportCmdArgs
+  #$exportCmdArgs = "/Online /Export-Driver /Destination:`"$ExportedDriversDir`""
+  $exportOutput = Run-Command "Dism.exe" "/Online"  "/Export-Driver" "/Destination:`"$ExportedDriversDir`""
   if ($LASTEXITCODE -ne 0) {
     Write-Warning "Failed to export drivers from OS using 'Dism.exe $exportCmdArgs'. Exit code: $LASTEXITCODE. Output: $exportOutput"
     Write-Warning "Skipping WinRE driver update due to export failure."
@@ -794,7 +795,6 @@ function Update-WinRE {
           }
       }
   }
-  
   Write-Host "Cleaning up full driver export directory: $ExportedDriversDir"
   Remove-Item -Path $ExportedDriversDir -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -807,7 +807,7 @@ function Update-WinRE {
 
   # --- Mount WinRE image ---
   Write-Host "Mounting WinRE image from `"$WinREImagePath`" to `"$WinREMountDir`"..."
-  $dismMountOutput = Run-Command "Dism.exe" "/Mount-Image /ImageFile:`"$WinREImagePath`" /Index:1 /MountDir:`"$WinREMountDir`""
+  $dismMountOutput = Run-Command "Dism.exe" "/Mount-Image" "/ImageFile:`"$WinREImagePath`"" "/Index:1" "/MountDir:`"$WinREMountDir`""
   if ($LASTEXITCODE -ne 0) {
     Write-Error "Failed to mount WinRE image. Exit code: $LASTEXITCODE. Output: $dismMountOutput"
     Write-Host "Attempting to cleanup mount directory $WinREMountDir..."
@@ -823,8 +823,9 @@ function Update-WinRE {
   foreach ($stagedDriverPackagePath in $DriversToInjectPaths) { 
     if (Test-Path $stagedDriverPackagePath -PathType Container) {
       Write-Host "Injecting drivers from directory: $stagedDriverPackagePath"
-      $dismAddDriverArgs = "/Image:`"$WinREMountDir`" /Add-Driver /Driver:`"$stagedDriverPackagePath`" /Recurse"
-      $dismAddDriverOutput = Run-Command "Dism.exe" $dismAddDriverArgs
+      #$dismAddDriverArgs = "/Image:`"$WinREMountDir`"" "/Add-Driver" "/Driver:`"$stagedDriverPackagePath`"" "/Recurse"
+      $dismAddDriverOutput = Run-Command "Dism.exe" "/Image:`"$WinREMountDir`"" "/Add-Driver" "/Driver:`"$stagedDriverPackagePath`"" "/Recurse"
+      #$dismAddDriverOutput = Run-Command "Dism.exe" $dismAddDriverArgs
       if ($LASTEXITCODE -ne 0) {
         Write-Warning "Failed to inject drivers from $stagedDriverPackagePath using 'Dism.exe $dismAddDriverArgs'. Exit code: $LASTEXITCODE. Output: $dismAddDriverOutput"
       } else {
@@ -837,11 +838,22 @@ function Update-WinRE {
 
   # --- Enable EMS in WinRE ---
   Write-Host "Enabling EMS in WinRE..."
-  $WinREBcdStorePath = Join-Path -Path $WinREMountDir -ChildPath "Windows\System32\Config\BCD"
+
+  foreach($i in Get-Partition -DiskNumber 0) { 
+   if ($i.Type -eq "System") { $efipart = $i }
+  }
+  Write-Output "EFI partition is: $($i.PartitionNumber)"
+  Write-Output "Assigning drive S: to EFI System partition..."
+  $DriveLetter = "S"
+  Set-Partition -InputObject $efipart -NewDriveLetter $DriveLetter
+
+  # Locate the BCD store
+  $WinREBcdStorePath = Join-Path -Path "S:" -ChildPath "EFI\Microsoft\Recovery\BCD"
+  # $bcdpath = 'S:\EFI\Microsoft\Boot\BCD'
   if (Test-Path $WinREBcdStorePath) {
-    $emsSettingsOutput = Run-Command "bcdedit.exe" "/store `"$WinREBcdStorePath`" /emssettings EMSPORT:2 EMSBAUDRATE:115200"
+    $emsSettingsOutput = Run-Command bcdedit /store `"$WinREBcdStorePath`" /emssettings EMSPORT:2 EMSBAUDRATE:115200
     Write-Host "bcdedit /emssettings output: $emsSettingsOutput"
-    $emsOnOutput = Run-Command "bcdedit.exe" "/store `"$WinREBcdStorePath`" /ems {default} on"
+    $emsOnOutput = Run-Command bcdedit.exe /store `"$WinREBcdStorePath`" /ems '{default}' on
     Write-Host "bcdedit /ems {default} on output: $emsOnOutput"
     Write-Host "EMS settings applied to WinRE BCD store."
   } else {
@@ -850,7 +862,7 @@ function Update-WinRE {
 
   # --- Unmount WinRE image and commit changes ---
   Write-Host "Unmounting WinRE image and committing changes..."
-  $dismUnmountOutput = Run-Command "Dism.exe" "/Unmount-Image /MountDir:`"$WinREMountDir`" /Commit"
+  $dismUnmountOutput = Run-Command "Dism.exe" "/Unmount-Image" "/MountDir:`"$WinREMountDir`""  "/Commit"
   if ($LASTEXITCODE -ne 0) {
     Write-Error "Failed to unmount and commit WinRE image. Exit code: $LASTEXITCODE. Output: $dismUnmountOutput"
     Write-Host "Manual cleanup of $WinREMountDir may be required. Check DISM logs."
@@ -865,6 +877,9 @@ function Update-WinRE {
   Write-Host "Cleaning up temporary directories..."
   if (Test-Path $WinREMountDir) { Remove-Item -Path $WinREMountDir -Recurse -Force -ErrorAction SilentlyContinue }
   if (Test-Path $DriversStagingDir) { Remove-Item -Path $DriversStagingDir -Recurse -Force -ErrorAction SilentlyContinue }
+  Get-Volume -Drive $DriveLetter | Get-Partition | Remove-PartitionAccessPath -accesspath "$DriveLetter`:\"
+
+
   Run-Command "Dism.exe" "/Cleanup-Mountpoints" # General DISM cleanup
 
   # --- Ensure WinRE is enabled ---
