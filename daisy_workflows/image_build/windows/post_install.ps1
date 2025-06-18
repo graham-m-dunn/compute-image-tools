@@ -675,6 +675,212 @@ function Install-PowerShell {
   }
 }
 
+function Get-WinREImagePath {
+  Write-Host "Attempting to locate winre.wim..."
+  $WinREImagePath = $null
+  try {
+    $reagentInfoOutput = Run-Command "reagentc.exe" "/info"
+    # $LASTEXITCODE is set by PowerShell after &$executable in Run-Command
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "reagentc.exe /info command failed with exit code $LASTEXITCODE. Output: $reagentInfoOutput"
+    } else {
+        $winreLocationLine = $reagentInfoOutput | Select-String -Pattern "Windows RE location:"
+        if ($winreLocationLine) {
+            # Example line: Windows RE location:       \\?\GLOBALROOT\device\harddisk0\partition1\Recovery\WindowsRE
+            $WinREDir = $winreLocationLine.Line.Split(':',2)[-1].Trim() # Takes the part after the first colon
+            if ($WinREDir -and $WinREDir -notmatch '^\s*$' -and $WinREDir -notmatch "not found" -and $WinREDir -notmatch "disabled") {
+                $potentialPath = Join-Path -Path $WinREDir -ChildPath "winre.wim"
+                Write-Host "Found WinRE directory from reagentc: $WinREDir. Potential image path: $potentialPath"
+                # DISM should handle \\?\GLOBALROOT paths. We'll let DISM validate it.
+                $WinREImagePath = $potentialPath
+            } else {
+                Write-Host "WinRE location from reagentc is empty, 'not found', or 'disabled'. Output: $WinREDir"
+            }
+        } else {
+            Write-Host "Could not parse 'Windows RE location:' from reagentc output: $reagentInfoOutput"
+        }
+    }
+  } catch {
+    Write-Warning "Exception while running or parsing reagentc /info: $($_.Exception.Message)"
+  }
+
+  if (-not $WinREImagePath) {
+    Write-Host "WinRE path not found or unusable via reagentc. Trying standard locations."
+    $StandardPath1 = Join-Path -Path $env:SystemDrive -ChildPath "Windows\System32\Recovery\winre.wim"
+    $StandardPath2 = Join-Path -Path $env:SystemDrive -ChildPath "Recovery\WindowsRE\winre.wim"
+
+    if (Test-Path $StandardPath1) {
+      $WinREImagePath = $StandardPath1
+      Write-Host "Found winre.wim at $StandardPath1"
+    } elseif (Test-Path $StandardPath2) {
+      $WinREImagePath = $StandardPath2
+      Write-Host "Found winre.wim at $StandardPath2"
+    } else {
+      Write-Warning "winre.wim not found in common standard locations either."
+      return $null
+    }
+  }
+  
+  # Final check to ensure the path is not empty before returning
+  if (-not $WinREImagePath -or $WinREImagePath -match '^\s*$') {
+      Write-Warning "Final WinREImagePath is empty or invalid."
+      return $null
+  }
+  Write-Host "Using WinRE image path: $WinREImagePath"
+  return $WinREImagePath
+}
+
+function Update-WinRE {
+  Write-Host "Updating Windows Recovery Environment (WinRE)..."
+  $WinREImagePath = Get-WinREImagePath
+  if (-not $WinREImagePath) {
+    Write-Warning "Could not locate winre.wim. Skipping WinRE update."
+    return
+  }
+
+  $WinREMountDir = "C:\WinRE_Mount_Temp"
+  $DriversStagingDir = "C:\WinRE_Drivers_Temp" # For filtered drivers to inject
+  $ExportedDriversDir = "C:\Exported_OS_Drivers" # Temp dir for all exported drivers
+  $dismMountOutput = $null # Initialize to check if mount was attempted
+
+  # Clean up and create temporary directories
+  foreach ($dir in $WinREMountDir, $DriversStagingDir, $ExportedDriversDir) {
+    if (Test-Path $dir) {
+      Write-Host "Removing existing temporary directory: $dir"
+      Remove-Item -Path $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  }
+
+  # --- Export All Third-Party Drivers from current OS ---
+  Write-Host "Exporting all third-party drivers from current OS to $ExportedDriversDir..."
+  # Note: DISM /Export-Driver exports third-party drivers.
+  # It creates subdirectories for each driver package.
+  $exportCmdArgs = "/Online /Export-Driver /Destination:`"$ExportedDriversDir`""
+  $exportOutput = Run-Command "Dism.exe" $exportCmdArgs
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warning "Failed to export drivers from OS using 'Dism.exe $exportCmdArgs'. Exit code: $LASTEXITCODE. Output: $exportOutput"
+    Write-Warning "Skipping WinRE driver update due to export failure."
+    if (Test-Path $ExportedDriversDir) { Remove-Item -Path $ExportedDriversDir -Recurse -Force -ErrorAction SilentlyContinue }
+    return
+  }
+  Write-Host "Drivers exported successfully to $ExportedDriversDir."
+
+  # --- Filter and Stage Required Drivers (gvnic, netkvm, vioscsi) ---
+  $DriversToInjectPaths = [System.Collections.ArrayList]@() 
+  $TargetDriverPrefixes = @("gvnic", "netkvm", "vioscsi") 
+  
+  Write-Host "Filtering and staging drivers starting with: $($TargetDriverPrefixes -join ', ') from $ExportedDriversDir to $DriversStagingDir"
+
+  $exportedDriverPackageDirs = Get-ChildItem -Path $ExportedDriversDir -Directory
+  if ($exportedDriverPackageDirs.Count -eq 0) {
+      Write-Warning "No driver package directories found in $ExportedDriversDir after export. Nothing to stage for WinRE."
+  } else {
+      foreach ($driverPackageDir in $exportedDriverPackageDirs) {
+          foreach ($prefix in $TargetDriverPrefixes) {
+              # Check if the directory name itself starts with the prefix
+              if ($driverPackageDir.Name.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                  $destinationPathInStaging = Join-Path -Path $DriversStagingDir -ChildPath $driverPackageDir.Name
+                  Write-Host "Copying driver package $($driverPackageDir.FullName) to $destinationPathInStaging"
+                  Copy-Item -Path $driverPackageDir.FullName -Destination $destinationPathInStaging -Recurse -Force
+                  if ($LASTEXITCODE -eq 0) {
+                      $null = $DriversToInjectPaths.Add($destinationPathInStaging) 
+                      Write-Host "Successfully staged $($driverPackageDir.Name)."
+                  } else {
+                      Write-Warning "Failed to copy $($driverPackageDir.Name) to staging directory $destinationPathInStaging."
+                  }
+                  break 
+              }
+          }
+      }
+  }
+  
+  Write-Host "Cleaning up full driver export directory: $ExportedDriversDir"
+  Remove-Item -Path $ExportedDriversDir -Recurse -Force -ErrorAction SilentlyContinue
+
+  if ($DriversToInjectPaths.Count -eq 0) {
+      Write-Warning "No target drivers (gvnic, netkvm, vioscsi based on directory name prefix) were found or staged from the OS export. Skipping WinRE driver injection."
+      if (Test-Path $DriversStagingDir) { Remove-Item -Path $DriversStagingDir -Recurse -Force -ErrorAction SilentlyContinue }
+      return 
+  }
+  Write-Host "Driver package directories to inject into WinRE: $($DriversToInjectPaths -join '; ')"
+
+  # --- Mount WinRE image ---
+  Write-Host "Mounting WinRE image from `"$WinREImagePath`" to `"$WinREMountDir`"..."
+  $dismMountOutput = Run-Command "Dism.exe" "/Mount-Image /ImageFile:`"$WinREImagePath`" /Index:1 /MountDir:`"$WinREMountDir`""
+  if ($LASTEXITCODE -ne 0) {
+    Write-Error "Failed to mount WinRE image. Exit code: $LASTEXITCODE. Output: $dismMountOutput"
+    Write-Host "Attempting to cleanup mount directory $WinREMountDir..."
+    Run-Command "Dism.exe" "/Cleanup-Mountpoints" 
+    if (Test-Path $WinREMountDir) { Remove-Item -Path $WinREMountDir -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $DriversStagingDir) { Remove-Item -Path $DriversStagingDir -Recurse -Force -ErrorAction SilentlyContinue }
+    return
+  }
+  Write-Host "WinRE image mounted successfully."
+
+  # --- Inject Drivers ---
+  Write-Host "Injecting drivers into WinRE image..."
+  foreach ($stagedDriverPackagePath in $DriversToInjectPaths) { 
+    if (Test-Path $stagedDriverPackagePath -PathType Container) {
+      Write-Host "Injecting drivers from directory: $stagedDriverPackagePath"
+      $dismAddDriverArgs = "/Image:`"$WinREMountDir`" /Add-Driver /Driver:`"$stagedDriverPackagePath`" /Recurse"
+      $dismAddDriverOutput = Run-Command "Dism.exe" $dismAddDriverArgs
+      if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Failed to inject drivers from $stagedDriverPackagePath using 'Dism.exe $dismAddDriverArgs'. Exit code: $LASTEXITCODE. Output: $dismAddDriverOutput"
+      } else {
+        Write-Host "Drivers from $stagedDriverPackagePath injected successfully."
+      }
+    } else {
+      Write-Warning "Staged driver package path $stagedDriverPackagePath not found or is not a directory. Skipping injection for this item."
+    }
+  }
+
+  # --- Enable EMS in WinRE ---
+  Write-Host "Enabling EMS in WinRE..."
+  $WinREBcdStorePath = Join-Path -Path $WinREMountDir -ChildPath "Windows\System32\Config\BCD"
+  if (Test-Path $WinREBcdStorePath) {
+    $emsSettingsOutput = Run-Command "bcdedit.exe" "/store `"$WinREBcdStorePath`" /emssettings EMSPORT:2 EMSBAUDRATE:115200"
+    Write-Host "bcdedit /emssettings output: $emsSettingsOutput"
+    $emsOnOutput = Run-Command "bcdedit.exe" "/store `"$WinREBcdStorePath`" /ems {default} on"
+    Write-Host "bcdedit /ems {default} on output: $emsOnOutput"
+    Write-Host "EMS settings applied to WinRE BCD store."
+  } else {
+    Write-Warning "WinRE BCD store not found at $WinREBcdStorePath. Skipping EMS enablement for WinRE."
+  }
+
+  # --- Unmount WinRE image and commit changes ---
+  Write-Host "Unmounting WinRE image and committing changes..."
+  $dismUnmountOutput = Run-Command "Dism.exe" "/Unmount-Image /MountDir:`"$WinREMountDir`" /Commit"
+  if ($LASTEXITCODE -ne 0) {
+    Write-Error "Failed to unmount and commit WinRE image. Exit code: $LASTEXITCODE. Output: $dismUnmountOutput"
+    Write-Host "Manual cleanup of $WinREMountDir may be required. Check DISM logs."
+    # Attempt to discard if commit fails to prevent inconsistent state?
+    # $dismDiscardOutput = Run-Command "Dism.exe" "/Unmount-Image /MountDir:`"$WinREMountDir`" /Discard"
+    # Write-Host "Attempted to discard changes. Output: $dismDiscardOutput"
+  } else {
+    Write-Host "WinRE image unmounted and changes committed successfully. Output: $dismUnmountOutput"
+  }
+
+  # --- Cleanup ---
+  Write-Host "Cleaning up temporary directories..."
+  if (Test-Path $WinREMountDir) { Remove-Item -Path $WinREMountDir -Recurse -Force -ErrorAction SilentlyContinue }
+  if (Test-Path $DriversStagingDir) { Remove-Item -Path $DriversStagingDir -Recurse -Force -ErrorAction SilentlyContinue }
+  Run-Command "Dism.exe" "/Cleanup-Mountpoints" # General DISM cleanup
+
+  # --- Ensure WinRE is enabled ---
+  Write-Host "Ensuring Windows RE is enabled..."
+  $reagentEnableOutput = Run-Command "reagentc.exe" "/enable"
+  Write-Host "reagentc /enable output: $reagentEnableOutput"
+  if ($LASTEXITCODE -ne 0) {
+      Write-Warning "reagentc /enable failed. Exit code $LASTEXITCODE."
+  }
+  $reagentInfoFinal = Run-Command "reagentc.exe" "/info"
+  Write-Host "Final WinRE status: $reagentInfoFinal"
+
+  Write-Host "WinRE update process completed."
+}
+
+
 try {
   Write-Host 'Beginning post install powershell script.'
 
@@ -729,6 +935,9 @@ try {
     Install-GCEAppPackages
     Set-Repos
   }
+
+  # Update WinRE with specified drivers and EMS settings
+  Update-WinRE
 
   Enable-WinRM
   Generate-NativeImage

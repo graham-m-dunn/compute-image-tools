@@ -1,0 +1,14 @@
+timeout: 14400s  # 4 hour timeout for entire build
+steps:
+- name: 'gcr.io/compute-image-tools/daisy'
+  timeout: 14400s  # 4 hour timeout for build step
+  waitFor: ['-']
+  args:
+    - -project=$PROJECT_ID
+    - -zone=us-central1-a
+    - -var:updates=gs://$PROJECT_ID-media/updates/
+    - -var:pwsh=gs://$PROJECT_ID-media/PowerShell.msi
+    - -var:dotnet48=gs://$PROJECT_ID-media/dotnet-sdk.exe
+    - -var:cloudsdk=gs://$PROJECT_ID-media/GoogleCloudSDKInstaller.exe
+    - -var:media=gs://$PROJECT_ID-media/SW_DVD9_Win_Server_STD_CORE_2025_24H2_64Bit_English_DC_STD_MLF_X23-81891.ISO
+    - windows-server-2025-dc-uefi-payg.wf.json
